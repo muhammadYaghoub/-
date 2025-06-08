@@ -1,0 +1,145 @@
+function createSpurGearSTL()
+    % Parameters for the spur gear
+    module = 3;         % Module (pitch diameter divided by number of teeth)
+    numTeeth = 20;      % Number of teeth
+    pressureAngle = 20; % Pressure angle in degrees
+    faceWidth = 10;     % Gear thickness
+    hubDiameter = 20;   % Diameter of the hub
+    hubLength = 15;     % Length of the hub
+    boreDiameter = 10;   % Diameter of the bore
+    
+    % Calculate derived parameters
+    pitchDiameter = module * numTeeth;
+    addendum = module;
+    dedendum = 1.25 * module;
+    outerDiameter = pitchDiameter + 2 * addendum;
+    rootDiameter = pitchDiameter - 2 * dedendum;
+    
+    % Create tooth profile
+    [xTooth, yTooth] = createToothProfile(module, numTeeth, pressureAngle);
+    
+    % Extrude tooth profile to 3D
+    tooth3D = extrudeProfile(xTooth, yTooth, faceWidth);
+    
+    % Create gear body (cylinder)
+    [xBody, yBody, zBody] = cylinder([rootDiameter/2 rootDiameter/2], 50);
+    zBody = zBody * faceWidth;
+    
+    % Create hub
+    [xHub, yHub, zHub] = cylinder([hubDiameter/2 hubDiameter/2], 50);
+    zHub = zHub * hubLength + faceWidth;
+    
+    % Create bore
+    [xBore, yBore, zBore] = cylinder([boreDiameter/2 boreDiameter/2], 50);
+    zBore = zBore * (faceWidth + hubLength);
+    
+    % Combine all parts
+    [gearX, gearY, gearZ] = combineParts(...
+        tooth3D, xBody, yBody, zBody, xHub, yHub, zHub, xBore, yBore, zBore);
+    
+    % Create triangulation object
+    gearTri = delaunayTriangulation(gearX(:), gearY(:), gearZ(:));
+    [gearFaces, gearVertices] = freeBoundary(gearTri);
+    
+    % Create and save STL file
+    gearSTL = triangulation(gearFaces, gearVertices);
+    stlwrite(gearSTL, 'spur_gear.stl');
+    
+    % Display the gear
+    figure;
+    trisurf(gearFaces, gearVertices(:,1), gearVertices(:,2), gearVertices(:,3));
+    axis equal;
+    title('Spur Gear');
+    xlabel('X'); ylabel('Y'); zlabel('Z');
+end
+
+function [x, y] = createToothProfile(module, numTeeth, pressureAngle)
+    % Create a single tooth profile
+    pressureAngle = deg2rad(pressureAngle);
+    pitchDiameter = module * numTeeth;
+    baseDiameter = pitchDiameter * cos(pressureAngle);
+    
+    % Points per tooth
+    nPoints = 50;
+    
+    % Initialize arrays
+    x = zeros(1, 2*nPoints);
+    y = zeros(1, 2*nPoints);
+    
+    % Create involute curve for one side of tooth
+    for i = 1:nPoints
+        angle = i * pi / (2 * nPoints);
+        x(i) = (baseDiameter/2) * (cos(angle) + angle * sin(angle));
+        y(i) = (baseDiameter/2) * (sin(angle) - angle * cos(angle));
+    end
+    
+    % Mirror for other side of tooth
+    x(nPoints+1:2*nPoints) = x(nPoints:-1:1);
+    y(nPoints+1:2*nPoints) = -y(nPoints:-1:1);
+    
+    % Scale and center the tooth
+    x = x - mean(x);
+    y = y - min(y) + module * 1.25;  % Add dedendum
+    
+    % Rotate tooth to align with gear
+    toothAngle = pi / numTeeth;
+    rotMat = [cos(toothAngle) -sin(toothAngle); sin(toothAngle) cos(toothAngle)];
+    xyRot = rotMat * [x; y];
+    x = xyRot(1,:);
+    y = xyRot(2,:);
+end
+
+function tooth3D = extrudeProfile(x, y, thickness)
+    % Extrude 2D profile to 3D
+    nPoints = length(x);
+    tooth3D = zeros(nPoints, 3, 2);
+    
+    % Bottom face
+    tooth3D(:,1,1) = x';
+    tooth3D(:,2,1) = y';
+    tooth3D(:,3,1) = 0;
+    
+    % Top face
+    tooth3D(:,1,2) = x';
+    tooth3D(:,2,2) = y';
+    tooth3D(:,3,2) = thickness;
+end
+
+function [x, y, z] = combineParts(tooth3D, xBody, yBody, zBody, xHub, yHub, zHub, xBore, yBore, zBore)
+    % Combine all parts into a single mesh
+    
+    % Initialize arrays
+    x = [];
+    y = [];
+    z = [];
+    
+    % Add teeth (create circular pattern)
+    numTeeth = 20; % Should match the parameter
+    for i = 1:numTeeth
+        angle = 2*pi*i/numTeeth;
+        rotMat = [cos(angle) -sin(angle) 0; sin(angle) cos(angle) 0; 0 0 1];
+        
+        % Rotate and add tooth
+        for face = 1:2
+            rotated = rotMat * squeeze(tooth3D(:,:,face))';
+            x = [x; rotated(1,:)'];
+            y = [y; rotated(2,:)'];
+            z = [z; rotated(3,:)'];
+        end
+    end
+    
+    % Add gear body
+    x = [x; xBody(:)];
+    y = [y; yBody(:)];
+    z = [z; zBody(:)];
+    
+    % Add hub
+    x = [x; xHub(:)];
+    y = [y; yHub(:)];
+    z = [z; zHub(:)];
+    
+    % Add bore
+    x = [x; xBore(:)];
+    y = [y; yBore(:)];
+    z = [z; zBore(:)];
+end
