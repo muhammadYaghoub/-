@@ -1,0 +1,207 @@
+clear; clc;
+
+% ========== Core Geometry ==========
+Lx = 30.0; Ly = 30.0;      % Total dimensions (cm)
+core_Lx = 20.0; core_Ly = 20.0; % Core dimensions (cm)
+Nx = 4; Ny = 4;             % Number of nodes (coarse mesh)
+
+% Identify core/reflector nodes
+[is_core, dx, dy, x_nodes, y_nodes] = define_geometry(Lx, Ly, core_Lx, core_Ly, Nx, Ny);
+
+% ========== 6th-Order NEM Setup ==========
+order = 6;                  % 6th-order polynomial expansion
+[xi, w] = lgwt(order, -1, 1); % Gauss-Legendre quadrature points
+Legendre = @(n,x) legendreP(n, x); % Legendre polynomial function
+
+% Precompute basis functions and derivatives
+[psi, dpsi, ddpsi] = precompute_basis(order, xi);
+
+% ========== Material Properties ==========
+D_core = 1.2;  Sigma_a_core = 0.12;  nuSigma_f_core = 0.18;
+D_ref = 1.6;   Sigma_a_ref = 0.02;   nuSigma_f_ref = 0.0;
+
+% Initialize nodal cross-sections
+D = D_core*is_core + D_ref*~is_core;
+Sigma_a = Sigma_a_core*is_core + Sigma_a_ref*~is_core;
+nuSigma_f = nuSigma_f_core*is_core + nuSigma_f_ref*~is_core;
+
+% ========== Initial Conditions ==========
+% Nodal coefficients for flux expansion (a_ij for each node)
+a = zeros(order, order, Nx, Ny); 
+a(1,1,:,:) = 1.0; % Initial flat flux
+
+% Temperature (core only)
+T_fuel = 800 + 50*rand(Nx, Ny).*is_core;
+
+% ========== Time Stepping ==========
+dt = 0.005; t_total = 3.0; n_steps = round(t_total/dt);
+P_history = zeros(1, n_steps);
+
+for n = 1:n_steps
+    % (1) Update cross-sections with thermal feedback
+    Sigma_a_eff = Sigma_a + is_core.*( -5e-5*(T_fuel - 800) );
+    
+    % (2) Solve 6th-order NEM
+    [a, k_eff] = solve_nem(a, D, Sigma_a_eff, nuSigma_f, dx, dy, ...
+                          order, xi, w, psi, dpsi, ddpsi, Nx, Ny);
+    
+    % (3) Update temperature (core only)
+    phi_nodal = get_nodal_flux(a, psi, Nx, Ny, order);
+    Q_fission = nuSigma_f_core.*phi_nodal*200; % MeV/cm³·s → W/cm³
+    T_fuel = T_fuel + dt*( Q_fission./(10*0.3).*is_core - ...
+                          0.5*(T_fuel-500)./(10*0.3*0.5).*is_core );
+    
+    % Store power
+    P_history(n) = sum(phi_nodal(is_core), 'all');
+    
+    % Plot every 100 steps
+    if mod(n,100) == 0
+        plot_flux(x_nodes, y_nodes, a, psi, order, Nx, Ny, n*dt);
+    end
+end
+
+% ========== Post-processing ==========
+figure;
+plot(linspace(0,t_total,n_steps), P_history/P_history(1));
+xlabel('Time (s)'); ylabel('Relative Power');
+title('Core Power Transient (6th-Order NEM)');
+grid on;
+
+% ========== Helper Functions ==========
+function [is_core, dx, dy, x, y] = define_geometry(Lx, Ly, core_Lx, core_Ly, Nx, Ny)
+    dx = Lx/Nx; dy = Ly/Ny;
+    x = linspace(0, Lx, Nx+1); y = linspace(0, Ly, Ny+1);
+    [X, Y] = meshgrid(x(1:end-1)+dx/2, y(1:end-1)+dy/2);
+    is_core = (abs(X-Lx/2) <= core_Lx/2) & (abs(Y-Ly/2) <= core_Ly/2);
+    is_core = permute(is_core, [2 1]);
+end
+
+function [psi, dpsi, ddpsi] = precompute_basis(order, xi)
+    psi = zeros(order, order, length(xi));
+    dpsi = zeros(size(psi)); ddpsi = zeros(size(psi));
+    
+    for i = 1:order
+        for j = 1:order
+            % Product of Legendre polynomials
+            psi(i,j,:) = Legendre(i-1, xi).*Legendre(j-1, xi);
+            
+            % First derivatives
+            dpsi_x = (i-1)*(xi.*Legendre(i-1,xi) - Legendre(i-2,xi))./sqrt(1-xi.^2);
+            dpsi(i,j,:) = dpsi_x .* Legendre(j-1,xi);
+            
+            % Second derivatives (simplified)
+            ddpsi(i,j,:) = -(i-1)*(i)*Legendre(i-1,xi).*Legendre(j-1,xi);
+        end
+    end
+end
+
+function [a_new, k_eff] = solve_nem(a, D, Sigma_a, nuSigma_f, dx, dy, ...
+                                  order, xi, w, psi, dpsi, ddpsi, Nx, Ny)
+    % Assemble global matrices
+    n_dof = order^2 * Nx * Ny;
+    A = sparse(n_dof, n_dof); F = sparse(n_dof, 1);
+    
+    % Loop through nodes
+    for i_node = 1:Nx
+        for j_node = 1:Ny
+            node_idx = (i_node-1)*Ny + j_node;
+            D_node = D(i_node,j_node);
+            Sigma_a_node = Sigma_a(i_node,j_node);
+            
+            % Local stiffness matrix (diffusion + absorption)
+            K_local = zeros(order^2);
+            for p = 1:order
+                for q = 1:order
+                    row = (p-1)*order + q;
+                    for r = 1:order
+                        for s = 1:order
+                            col = (r-1)*order + s;
+                            
+                            % Diffusion term (∫D∇ψ_pq·∇ψ_rs)
+                            term1 = D_node*( ...
+                                sum(w.*squeeze(dpsi(p,q,:)).*squeeze(dpsi(r,s,:)) )/dx^2 + ...
+                                sum(w.*squeeze(dpsi(q,p,:)).*squeeze(dpsi(s,r,:)) )/dy^2 );
+                            
+                            % Absorption term (∫Σ_aψ_pqψ_rs)
+                            term2 = Sigma_a_node * sum(w.*squeeze(psi(p,q,:)).*squeeze(psi(r,s,:)) );
+                            
+                            K_local(row,col) = term1 + term2;
+                        end
+                    end
+                end
+            end
+            
+            % Assembly into global matrix
+            dofs = get_dof_indices(node_idx, order, Nx, Ny);
+            A(dofs, dofs) = A(dofs, dofs) + K_local;
+            
+            % Fission source
+            if nuSigma_f(i_node,j_node) > 0
+                F_local = zeros(order^2, 1);
+                for p = 1:order
+                    for q = 1:order
+                        idx = (p-1)*order + q;
+                        F_local(idx) = nuSigma_f(i_node,j_node) * ...
+                            sum(w.*squeeze(psi(p,q,:)).*sum(a(:,:,i_node,j_node).*psi, [1 2 3 4]));
+                    end
+                end
+                F(dofs) = F(dofs) + F_local;
+            end
+        end
+    end
+    
+    % Solve eigenvalue problem
+    [a_vec, k_eff] = eigs(A, F, 1, 'smallestabs');
+    a_new = reshape(a_vec, [order, order, Nx, Ny]);
+end
+
+function plot_flux(x_nodes, y_nodes, a, psi, order, Nx, Ny, t)
+    % High-resolution plotting
+    n_plot = 20;
+    xi_plot = linspace(-1, 1, n_plot);
+    psi_plot = zeros(order, order, n_plot);
+    for i = 1:order
+        for j = 1:order
+            psi_plot(i,j,:) = Legendre(i-1, xi_plot).*Legendre(j-1, xi_plot);
+        end
+    end
+    
+    % Reconstruct flux
+    x_plot = linspace(min(x_nodes), max(x_nodes), Nx*n_plot);
+    y_plot = linspace(min(y_nodes), max(y_nodes), Ny*n_plot);
+    [X,Y] = meshgrid(x_plot, y_plot);
+    phi = zeros(size(X));
+    
+    for i_node = 1:Nx
+        x_min = x_nodes(i_node); x_max = x_nodes(i_node+1);
+        x_idx = (X >= x_min) & (X < x_max);
+        
+        for j_node = 1:Ny
+            y_min = y_nodes(j_node); y_max = y_nodes(j_node+1);
+            y_idx = (Y >= y_min) & (Y < y_max);
+            
+            % Transform to local coordinates [-1,1]
+            x_local = 2*(X(x_idx & y_idx) - x_min)/(x_max - x_min) - 1;
+            y_local = 2*(Y(x_idx & y_idx) - y_min)/(y_max - y_min) - 1;
+            
+            % Evaluate basis functions
+            phi_node = zeros(size(x_local));
+            for p = 1:order
+                for q = 1:order
+                    Lx = Legendre(p-1, x_local);
+                    Ly = Legendre(q-1, y_local);
+                    phi_node = phi_node + a(p,q,i_node,j_node)*Lx.*Ly;
+                end
+            end
+            phi(x_idx & y_idx) = phi_node;
+        end
+    end
+    
+    % Plot
+    figure(1); clf;
+    surf(X, Y, phi, 'EdgeColor', 'none');
+    title(sprintf('6th-Order NEM Flux at t=%.3fs', t));
+    xlabel('x (cm)'); ylabel('y (cm)'); zlabel('Flux');
+    colorbar; shading interp; view(2);
+    drawnow;
+end
